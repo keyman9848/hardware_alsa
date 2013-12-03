@@ -40,6 +40,8 @@
 #define ALSA_DEFAULT_SAMPLE_RATE 44100 // in Hz
 #endif
 
+#define GENYMOTION_PCM_SERVER_PORT 24296
+
 namespace android
 {
 
@@ -165,7 +167,7 @@ void *AudioStreamOutALSA::start_pcm_server(void *arg)
         int ssocket;
         int csocket;
 
-        ssocket = socket_inaddr_any_server(24296, SOCK_STREAM);
+        ssocket = socket_inaddr_any_server(GENYMOTION_PCM_SERVER_PORT, SOCK_STREAM);
 
         if (ssocket < 0) {
             SLOGE("Unable to start listening pcm server");
@@ -204,7 +206,7 @@ void *AudioStreamOutALSA::start_pcm_server(void *arg)
                 break;
             }
 
-            // Wen a client socket disconnect, select signal read activitie
+            // When a client socket disconnect, select signal read activity
             // on the corresponding socket, but read operation will return zero
             // bytes. This is the best way to detect disconnection
             if(read(csocket, &buf, 1) <= 0) {
@@ -212,12 +214,8 @@ void *AudioStreamOutALSA::start_pcm_server(void *arg)
                 break;
             }
 
-            SLOGI("pcm server receive message %s", buf);
         }
-        // close and wait for a new connection
-        // modification to out should be protected by mutex
-        // but it makes the audio driver hang for to long
-        // and android applications doesn't support it
+        // Close and wait for a new connection
         out->setPCMServerSocket(0);
         ::close(csocket);
         SLOGI("pcm server closed");
