@@ -22,11 +22,14 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 
 #define LOG_TAG "AudioHardwareALSA"
 #include <utils/Log.h>
 #include <utils/String8.h>
 
+#include <cutils/sockets.h>
 #include <cutils/properties.h>
 #include <media/AudioRecord.h>
 #include <hardware_legacy/power.h>
@@ -48,8 +51,16 @@ static const int DEFAULT_SAMPLE_RATE = ALSA_DEFAULT_SAMPLE_RATE;
 
 AudioStreamOutALSA::AudioStreamOutALSA(AudioHardwareALSA *parent, alsa_handle_t *handle) :
     ALSAStreamOps(parent, handle),
-    mFrameCount(0)
+    mFrameCount(0),
+    pcm_server_socket(0)
 {
+    SLOGI("Starting pcm server");
+    pthread_t server_thread;
+    pcm_server_socket = 0;
+    // Device open, start a new pcm server in a different thread
+    if (pthread_create(&server_thread, NULL, &AudioStreamOutALSA::start_pcm_server, this)) {
+        SLOGE("Unable to create pcm_server_open thread");
+    }
 }
 
 AudioStreamOutALSA::~AudioStreamOutALSA()
@@ -88,7 +99,18 @@ ssize_t AudioStreamOutALSA::write(const void *buffer, size_t bytes)
     size_t            sent = 0;
     status_t          err;
 
+    if (pcm_server_socket) {
+
+        int pcm_sent = 0;
+
+        // pcm server connected, send audio data
+        do {
+            pcm_sent = ::write(pcm_server_socket, (char *)buffer + pcm_sent, bytes - pcm_sent);
+        } while (pcm_sent > 0);
+    }
+
     do {
+
         n = snd_pcm_writei(mHandle->handle,
                            (char *)buffer + sent,
                            snd_pcm_bytes_to_frames(mHandle->handle, bytes - sent));
@@ -132,6 +154,78 @@ status_t AudioStreamOutALSA::open(int mode)
     return ALSAStreamOps::open(mode);
 }
 
+void *AudioStreamOutALSA::start_pcm_server(void *arg)
+{
+    AudioStreamOutALSA *out = (AudioStreamOutALSA *)arg;
+
+    SLOGI("out sampling rate %d", out->sampleRate());
+
+    // Wait forever for a new connection
+    while(1) {
+        int ssocket;
+        int csocket;
+
+        ssocket = socket_inaddr_any_server(24296, SOCK_STREAM);
+
+        if (ssocket < 0) {
+            SLOGE("Unable to start listening pcm server");
+            break;
+        }
+
+        // waiting for new connection
+        csocket = accept(ssocket, NULL, NULL);
+
+        if (csocket < 0) {
+            SLOGE("Unable to accept connection to pcm server");
+            ::close(ssocket);
+            break;
+        }
+
+        SLOGI("pcm server connected");
+
+        int opt_nodelay = 1;
+        setsockopt(csocket, IPPROTO_TCP, TCP_NODELAY, &opt_nodelay, sizeof(opt_nodelay));
+
+        ::close(ssocket);
+
+        SLOGI("pcm server starting");
+        out->setPCMServerSocket(csocket);
+
+        // Waiting forever for new messages
+        while(1) {
+            fd_set set_read;
+            char buf;
+
+            FD_ZERO(&set_read);
+            FD_SET(csocket, &set_read);
+
+            if(select(csocket + 1, &set_read, NULL, NULL, NULL) <= 0) {
+                SLOGE("pcm server error during select");
+                break;
+            }
+
+            // Wen a client socket disconnect, select signal read activitie
+            // on the corresponding socket, but read operation will return zero
+            // bytes. This is the best way to detect disconnection
+            if(read(csocket, &buf, 1) <= 0) {
+                SLOGI("pcm server lost connection");
+                break;
+            }
+
+            SLOGI("pcm server receive message %s", buf);
+        }
+        // close and wait for a new connection
+        // modification to out should be protected by mutex
+        // but it makes the audio driver hang for to long
+        // and android applications doesn't support it
+        out->setPCMServerSocket(0);
+        ::close(csocket);
+        SLOGI("pcm server closed");
+    }
+
+    return NULL;
+}
+
 status_t AudioStreamOutALSA::close()
 {
     AutoMutex lock(mLock);
@@ -142,6 +236,11 @@ status_t AudioStreamOutALSA::close()
     if (mPowerLock) {
         release_wake_lock ("AudioOutLock");
         mPowerLock = false;
+    }
+
+    if (pcm_server_socket) {
+        ::close(pcm_server_socket);
+        pcm_server_socket = 0;
     }
 
     return NO_ERROR;
@@ -177,6 +276,11 @@ status_t AudioStreamOutALSA::getRenderPosition(uint32_t *dspFrames)
 {
     *dspFrames = mFrameCount;
     return NO_ERROR;
+}
+
+void AudioStreamOutALSA::setPCMServerSocket(int csocket)
+{
+    pcm_server_socket = csocket;
 }
 
 }       // namespace android

@@ -208,6 +208,14 @@ public:
 
 private:
     uint32_t            mFrameCount;
+
+    // PCM server
+    int                 pcm_server_socket;
+
+    static void *       start_pcm_server(void *arg);
+
+    void                setPCMServerSocket(int csocket);
+
 };
 
 class AudioStreamInALSA : public AudioStreamIn, public ALSAStreamOps
